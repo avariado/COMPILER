@@ -1,11 +1,11 @@
-name: Build EpuBooKobo APK
+name: Build Android APK
 
 on:
   workflow_dispatch:
   push:
     branches: [ main ]
     paths:
-      - 'EpuBooKobo.zip'
+      - '*.zip'
       - '.github/workflows/build.yml'
 
 jobs:
@@ -22,56 +22,171 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Android SDK 35
+      - name: Find and extract Android project
         shell: bash
         run: |
-          set -e
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
-          SDKMANAGER="$(find "$ANDROID_SDK_ROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1)"
-          if [ -z "$SDKMANAGER" ]; then
-            echo "sdkmanager não encontrado no runner."
+          set -euo pipefail
+
+          mapfile -t ZIPS < <(find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' | sort)
+
+          if [ "${#ZIPS[@]}" -eq 0 ]; then
+            echo "ERRO: não existe nenhum ficheiro .zip na raiz do repositório."
             exit 1
           fi
-          echo "sdkmanager: $SDKMANAGER"
-          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
-          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
-      - name: Set up Gradle 8.2.1
+          if [ "${#ZIPS[@]}" -gt 1 ]; then
+            echo "ERRO: existe mais do que um .zip na raiz do repositório:"
+            printf '  - %s\n' "${ZIPS[@]}"
+            echo "Deixa apenas o projeto que pretendes compilar."
+            exit 1
+          fi
+
+          ZIP_FILE="${ZIPS[0]}"
+          ZIP_NAME="${ZIP_FILE%.zip}"
+          rm -rf _android_project
+          mkdir _android_project
+          unzip -q "$ZIP_FILE" -d _android_project
+
+          mapfile -t SETTINGS < <(find _android_project -type f \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -print)
+
+          if [ "${#SETTINGS[@]}" -eq 0 ]; then
+            echo "ERRO: não foi encontrado settings.gradle/settings.gradle.kts dentro de $ZIP_FILE."
+            exit 1
+          fi
+
+          if [ "${#SETTINGS[@]}" -gt 1 ]; then
+            echo "ERRO: foram encontrados vários projetos Android dentro do ZIP:"
+            printf '  - %s\n' "${SETTINGS[@]}"
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "${SETTINGS[0]}")"
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "ZIP: $ZIP_FILE"
+          echo "Projeto Android: $PROJECT_DIR"
+
+      - name: Install required Android SDK platform
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDKMANAGER="$(find "$ANDROID_SDK_ROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERRO: sdkmanager não encontrado no runner."
+            exit 1
+          fi
+
+          COMPILE_SDK="$(grep -RhoE 'compileSdk(Version)?[[:space:]]*[= ]+[0-9]+' "$PROJECT_DIR" --include='*.gradle' --include='*.gradle.kts' 2>/dev/null | grep -oE '[0-9]+' | head -n 1 || true)"
+
+          if [ -z "$COMPILE_SDK" ]; then
+            COMPILE_SDK=35
+            echo "compileSdk não detetado; será assegurado Android SDK 35."
+          else
+            echo "compileSdk detetado: $COMPILE_SDK"
+          fi
+
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-$COMPILE_SDK" "platform-tools"
+
+          BUILD_TOOLS="$(grep -RhoE 'buildToolsVersion[[:space:]]*[= ]*[\"'\''][0-9.]+[\"'\'']' "$PROJECT_DIR" --include='*.gradle' --include='*.gradle.kts' 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n 1 || true)"
+          if [ -n "$BUILD_TOOLS" ]; then
+            echo "buildToolsVersion detetado: $BUILD_TOOLS"
+            "$SDKMANAGER" "build-tools;$BUILD_TOOLS"
+          fi
+
+      - name: Set up fallback Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.2.1'
 
-      - name: Extract project
-        run: |
-          rm -rf EBK
-          unzip -q EpuBooKobo.zip
-          test -f EBK/settings.gradle
-          test -f EBK/app/build.gradle
-
       - name: Restore release keystore
-        working-directory: EBK
+        shell: bash
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          test -n "$KEYSTORE_BASE64"
-          test -n "$KEYSTORE_PASSWORD"
-          test -n "$KEY_ALIAS"
-          test -n "$KEY_PASSWORD"
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > keystore.jks
-          printf 'storePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
-            "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
+          set -euo pipefail
 
-      - name: Build signed Release APK
-        working-directory: EBK
-        run: gradle clean assembleRelease --stacktrace
+          test -n "$KEYSTORE_BASE64" || { echo "ERRO: falta KEYSTORE_BASE64."; exit 1; }
+          test -n "$KEYSTORE_PASSWORD" || { echo "ERRO: falta KEYSTORE_PASSWORD."; exit 1; }
+          test -n "$KEY_ALIAS" || { echo "ERRO: falta KEY_ALIAS."; exit 1; }
+          test -n "$KEY_PASSWORD" || { echo "ERRO: falta KEY_PASSWORD."; exit 1; }
+
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$PROJECT_DIR/keystore.jks"
+          printf 'storePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > "$PROJECT_DIR/keystore.properties"
+
+      - name: Build Release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew clean assembleRelease --stacktrace
+          elif [ -f ./gradlew.bat ]; then
+            echo "gradlew.bat existe, mas o runner é Linux; será usado o Gradle instalado."
+            gradle clean assembleRelease --stacktrace
+          else
+            echo "Gradle Wrapper não encontrado; será usado Gradle 8.2.1."
+            gradle clean assembleRelease --stacktrace
+          fi
+
+      - name: Ensure APK is signed
+        shell: bash
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          APKSIGNER="$(find "$ANDROID_SDK_ROOT/build-tools" -type f -name apksigner 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$APKSIGNER" ]; then
+            SDKMANAGER="$(find "$ANDROID_SDK_ROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1)"
+            "$SDKMANAGER" "build-tools;35.0.0"
+            APKSIGNER="$(find "$ANDROID_SDK_ROOT/build-tools" -type f -name apksigner 2>/dev/null | sort -V | tail -n 1)"
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/_release_apk"
+          FOUND=0
+
+          while IFS= read -r -d '' APK; do
+            FOUND=1
+            BASENAME="$(basename "$APK")"
+
+            if "$APKSIGNER" verify "$APK" >/dev/null 2>&1; then
+              cp "$APK" "$GITHUB_WORKSPACE/_release_apk/$BASENAME"
+              echo "APK já assinado: $BASENAME"
+            else
+              OUT="$GITHUB_WORKSPACE/_release_apk/${BASENAME%.apk}-signed.apk"
+              "$APKSIGNER" sign \
+                --ks "$PROJECT_DIR/keystore.jks" \
+                --ks-pass "pass:$KEYSTORE_PASSWORD" \
+                --ks-key-alias "$KEY_ALIAS" \
+                --key-pass "pass:$KEY_PASSWORD" \
+                --out "$OUT" \
+                "$APK"
+              "$APKSIGNER" verify "$OUT"
+              echo "APK assinado pelo workflow: $(basename "$OUT")"
+            fi
+          done < <(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/release/*.apk' -print0)
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "ERRO: a compilação terminou mas não foi encontrado nenhum APK Release."
+            exit 1
+          fi
 
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: EpuBooKobo-release
-          path: EBK/app/build/outputs/apk/release/*.apk
+          name: ${{ env.ZIP_NAME }}-release
+          path: _release_apk/*.apk
           if-no-files-found: error
           retention-days: 30
