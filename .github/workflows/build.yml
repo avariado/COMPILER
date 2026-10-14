@@ -97,10 +97,81 @@ jobs:
             "$SDKMANAGER" "build-tools;$BUILD_TOOLS"
           fi
 
-      - name: Set up fallback Gradle
+      - name: Detect compatible Gradle version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT_DIR"])
+          version = None
+
+          # 1) Preferir a versão declarada pelo próprio projeto.
+          wrapper = project / "gradle" / "wrapper" / "gradle-wrapper.properties"
+          if wrapper.exists():
+              text = wrapper.read_text(encoding="utf-8", errors="ignore")
+              m = re.search(r"gradle-([0-9]+(?:\.[0-9]+){1,2})-(?:bin|all)\.zip", text)
+              if m:
+                  version = m.group(1)
+                  print(f"Versão Gradle indicada pelo projeto: {version}")
+
+          # 2) Sem versão de wrapper, detetar o Android Gradle Plugin.
+          if not version:
+              agp = None
+              files = list(project.rglob("*.gradle")) + list(project.rglob("*.gradle.kts"))
+              for f in files:
+                  try:
+                      text = f.read_text(encoding="utf-8", errors="ignore")
+                  except Exception:
+                      continue
+
+                  patterns = [
+                      r"com\.android\.tools\.build:gradle:([0-9]+(?:\.[0-9]+){1,2})",
+                      r"(?:id\s*\(?\s*[\"']com\.android\.(?:application|library)[\"']\s*\)?|alias\([^)]*android[^)]*\))[^\n]*?version\s*[= ]*\(?\s*[\"']([0-9]+(?:\.[0-9]+){1,2})[\"']",
+                  ]
+                  for pat in patterns:
+                      m = re.search(pat, text, re.I)
+                      if m:
+                          agp = m.group(1)
+                          break
+                  if agp:
+                      break
+
+              if agp:
+                  print(f"Android Gradle Plugin detetado: {agp}")
+                  parts = [int(x) for x in agp.split('.')[:2]]
+                  major, minor = parts[0], parts[1] if len(parts) > 1 else 0
+
+                  if major >= 9:
+                      version = "9.1.0"
+                  elif major == 8:
+                      mapping = {
+                          0: "8.2.1", 1: "8.2.1", 2: "8.2.1",
+                          3: "8.4", 4: "8.6", 5: "8.7", 6: "8.7",
+                          7: "8.9", 8: "8.10.2", 9: "8.11.1",
+                          10: "8.13", 11: "8.13",
+                      }
+                      version = mapping.get(minor, "8.14.3")
+                  else:
+                      version = "8.2.1"
+                  print(f"Gradle compatível selecionado: {version}")
+
+          # 3) Último recurso.
+          if not version:
+              version = "8.14.3"
+              print(f"Versões não detetadas; fallback Gradle: {version}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"GRADLE_VERSION={version}\n")
+          PY
+
+      - name: Set up compatible Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.2.1'
+          gradle-version: ${{ env.GRADLE_VERSION }}
 
       - name: Restore release keystore
         shell: bash
@@ -134,7 +205,7 @@ jobs:
             echo "gradlew.bat existe, mas o runner é Linux; será usado o Gradle instalado."
             gradle clean assembleRelease --stacktrace
           else
-            echo "Gradle Wrapper não encontrado; será usado Gradle 8.2.1."
+            echo "Gradle Wrapper não encontrado; será usado Gradle $GRADLE_VERSION."
             gradle clean assembleRelease --stacktrace
           fi
 
